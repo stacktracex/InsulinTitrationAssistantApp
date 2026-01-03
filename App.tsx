@@ -1,215 +1,270 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Layout } from './components/Layout';
-import { calculateInitialDose, getSuggestedDose, DEFAULT_CONFIG } from './services/insulinLogic';
-import { DailyRecord, AppState, TitrationConfig, UserProfile } from './types';
+import { getSuggestedDose, DEFAULT_CONFIG } from './services/insulinLogic';
+import { DailyRecord, UserProfile } from './types';
 
-// 定义 SheetJS 全局变量引用
 declare const XLSX: any;
+
+const DB_NAME = 'InsulinHelperDB';
+const DB_VERSION = 1;
+const STORES = {
+  USERS: 'users',
+  HISTORY: 'history',
+  CONFIG: 'config'
+};
+
+const Toast: React.FC<{ msg: string; type: 'success' | 'error' | 'info'; onClose: () => void }> = ({ msg, type, onClose }) => {
+  useEffect(() => {
+    const timer = setTimeout(onClose, 3000);
+    return () => clearTimeout(timer);
+  }, [onClose]);
+  const bgClass = type === 'error' ? 'bg-red-600' : type === 'success' ? 'bg-green-600' : 'bg-blue-600';
+  return (
+    <div className={`fixed top-5 left-1/2 -translate-x-1/2 ${bgClass} text-white px-6 py-3 rounded-2xl shadow-2xl z-[9999] animate-in fade-in slide-in-from-top-4 duration-300 font-bold text-sm flex items-center gap-2`}>
+      <span>{type === 'error' ? '⚠️' : type === 'success' ? '✅' : 'ℹ️'}</span>
+      {msg}
+    </div>
+  );
+};
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'login' | 'main' | 'history' | 'userList' | 'config'>('login');
-  const [state, setState] = useState<AppState>(() => {
-    const saved = localStorage.getItem('insulin_helper_v5_state');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      return {
-        users: parsed.users || [],
-        history: parsed.history || [],
-        config: parsed.config || DEFAULT_CONFIG,
-        activeUserPhone: parsed.activeUserPhone || null
-      };
-    }
-    return { users: [], history: [], config: DEFAULT_CONFIG, activeUserPhone: null };
-  });
+  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [history, setHistory] = useState<DailyRecord[]>([]);
+  const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [activeUserPhone, setActiveUserPhone] = useState<string | null>(null);
+  const [isDbReady, setIsDbReady] = useState(false);
+  const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' | 'info' } | null>(null);
 
-  // 状态变量
   const [newUser, setNewUser] = useState({ name: '', phone: '', weight: '' });
+  const [editingUser, setEditingUser] = useState<UserProfile | null>(null);
   const [userListPage, setUserListPage] = useState(1);
+  const [historyPage, setHistoryPage] = useState(1);
   const [historyFilter, setHistoryFilter] = useState({ phone: '', name: '' });
-  const [editingRecord, setEditingRecord] = useState<Partial<DailyRecord>>({
+  const [loginErrors, setLoginErrors] = useState<Record<string, boolean>>({});
+  const [recordErrors, setRecordErrors] = useState<Record<string, boolean>>({});
+
+  const initialEditingRecord: Partial<DailyRecord> = {
     date: new Date().toISOString().split('T')[0],
-    fbg: 0, preLunchBG: 0, preDinnerBG: 0, bedtimeBG: 0,
+    fbg: undefined, preLunchBG: undefined, preDinnerBG: undefined, bedtimeBG: undefined,
     curBasal: 0, curBreakfast: 0, curLunch: 0, curDinner: 0
-  });
+  };
+  const [editingRecord, setEditingRecord] = useState<Partial<DailyRecord>>(initialEditingRecord);
+
+  const showToast = (msg: string, type: 'success' | 'error' | 'info' = 'info') => setToast({ msg, type });
+
+  const getDB = useCallback((): Promise<IDBDatabase> => {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+      request.onupgradeneeded = (e: any) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(STORES.USERS)) db.createObjectStore(STORES.USERS, { keyPath: 'phone' });
+        if (!db.objectStoreNames.contains(STORES.HISTORY)) db.createObjectStore(STORES.HISTORY, { keyPath: 'id' });
+        if (!db.objectStoreNames.contains(STORES.CONFIG)) db.createObjectStore(STORES.CONFIG, { keyPath: 'id' });
+      };
+    });
+  }, []);
+
+  const dbOperation = useCallback(async (
+    storeNames: string[], 
+    mode: 'readonly' | 'readwrite', 
+    operation: (transaction: IDBTransaction) => void
+  ) => {
+    const db = await getDB();
+    const tx = db.transaction(storeNames, mode);
+    const promise = new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(new Error("Transaction aborted"));
+    });
+    operation(tx);
+    return promise;
+  }, [getDB]);
 
   useEffect(() => {
-    localStorage.setItem('insulin_helper_v5_state', JSON.stringify(state));
-  }, [state]);
+    const init = async () => {
+      try {
+        const db = await getDB();
+        const tx = db.transaction([STORES.USERS, STORES.HISTORY, STORES.CONFIG], 'readonly');
+        const uStore = tx.objectStore(STORES.USERS);
+        const hStore = tx.objectStore(STORES.HISTORY);
+        const cStore = tx.objectStore(STORES.CONFIG);
 
-  const currentUser = useMemo(() => 
-    state.users.find(u => u.phone === state.activeUserPhone) || null
-  , [state.users, state.activeUserPhone]);
+        const uReq = uStore.getAll();
+        const hReq = hStore.getAll();
+        const cReq = cStore.get('main_config');
 
-  // 手机号严格验证
-  const validatePhone = (phone: string) => /^1[3-9]\d{9}$/.test(phone);
+        uReq.onsuccess = () => setUsers(uReq.result || []);
+        hReq.onsuccess = () => setHistory((hReq.result || []).sort((a: any, b: any) => Number(b.id) - Number(a.id)));
+        cReq.onsuccess = () => cReq.result && setConfig(cReq.result.data);
+        setIsDbReady(true);
+      } catch (e) { showToast('DB Init Error', 'error'); }
+    };
+    init();
+  }, [getDB]);
 
-  const handleLogin = (phone?: string) => {
+  const currentUser = useMemo(() => users.find(u => u.phone === activeUserPhone) || null, [users, activeUserPhone]);
+  const suggestions = useMemo(() => getSuggestedDose(editingRecord, config), [editingRecord, config]);
+
+  const handleLogin = async (phone?: string) => {
     const targetPhone = phone || newUser.phone;
-    const existing = state.users.find(u => u.phone === targetPhone);
-    
+    const existing = users.find(u => u.phone === targetPhone);
     if (existing) {
-      setState(prev => ({ ...prev, activeUserPhone: existing.phone }));
+      setActiveUserPhone(existing.phone);
       setActiveTab('main');
-    } else {
-      if (!phone) {
-        if (!newUser.name || !newUser.weight) return alert('新用户请填写完整信息');
-        if (!validatePhone(newUser.phone)) return alert('请输入正确的11位手机号');
-        
-        const u: UserProfile = {
-          name: newUser.name,
-          phone: newUser.phone,
-          weight: Number(newUser.weight),
-          createdAt: new Date().toLocaleString('zh-CN')
-        };
-        setState(prev => ({
-          ...prev,
-          users: [u, ...prev.users],
-          activeUserPhone: u.phone
-        }));
-        setActiveTab('main');
-      } else {
-        alert('未找到该用户');
-      }
+      setLoginErrors({});
+      return;
+    }
+    if (!phone) {
+      const errs: Record<string, boolean> = {};
+      if (!newUser.phone || !/^1[3-9]\d{9}$/.test(newUser.phone)) errs.phone = true;
+      if (!newUser.name) errs.name = true;
+      if (!newUser.weight || Number(newUser.weight) <= 0) errs.weight = true;
+      if (Object.keys(errs).length > 0) { setLoginErrors(errs); return; }
+      const u: UserProfile = { name: newUser.name, phone: newUser.phone, weight: Number(newUser.weight), createdAt: new Date().toLocaleString() };
+      await dbOperation([STORES.USERS], 'readwrite', (tx) => tx.objectStore(STORES.USERS).add(u));
+      setUsers(prev => [u, ...prev]);
+      setActiveUserPhone(u.phone);
+      setActiveTab('main');
+      showToast(`患者 ${u.name} 已建档并登录`, 'success');
     }
   };
 
-  const PAGE_SIZE = 10;
-  const totalUserPages = Math.ceil(state.users.length / PAGE_SIZE);
-  const displayedUsers = state.users.slice((userListPage - 1) * PAGE_SIZE, userListPage * PAGE_SIZE);
-
-  const filteredHistory = useMemo(() => {
-    return state.history.filter(h => {
-      const user = state.users.find(u => u.phone === h.userPhone);
-      const phoneMatch = h.userPhone.includes(historyFilter.phone);
-      const nameMatch = user?.name.includes(historyFilter.name);
-      return phoneMatch && (historyFilter.name ? nameMatch : true);
-    });
-  }, [state.history, state.users, historyFilter]);
-
-  const exportToExcel = (mode: 'current' | 'all') => {
-    const dataToExport = mode === 'current' 
-      ? filteredHistory
-      : state.history;
-
-    if (dataToExport.length === 0) return alert('没有可导出的数据');
-
-    const worksheetData = dataToExport.map(r => {
-      const user = state.users.find(u => u.phone === r.userPhone);
-      return {
-        '日期': r.date,
-        '姓名': user?.name || '未知',
-        '手机号': r.userPhone,
-        '空腹血糖(mmol/L)': r.fbg,
-        '午餐前血糖(mmol/L)': r.preLunchBG,
-        '晚餐前血糖(mmol/L)': r.preDinnerBG,
-        '睡前血糖(mmol/L)': r.bedtimeBG,
-        '目前方案(早/午/晚/基)': `${r.curBreakfast}/${r.curLunch}/${r.curDinner}/${r.curBasal}`,
-        '调整建议(早/午/晚/基)': `${r.sugBreakfast}/${r.sugLunch}/${r.sugDinner}/${r.sugBasal}`
-      };
-    });
-
-    const worksheet = XLSX.utils.json_to_sheet(worksheetData);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "滴定记录数据");
-    
-    const fileName = mode === 'current' 
-      ? `筛选数据_${new Date().toISOString().split('T')[0]}.xlsx` 
-      : `全量患者数据_${new Date().toISOString().split('T')[0]}.xlsx`;
-    
-    XLSX.writeFile(workbook, fileName);
+  const handleUpdateUser = async () => {
+    if (!editingUser) return;
+    await dbOperation([STORES.USERS], 'readwrite', (tx) => tx.objectStore(STORES.USERS).put(editingUser));
+    setUsers(prev => prev.map(u => u.phone === editingUser.phone ? editingUser : u));
+    setEditingUser(null);
+    showToast('档案更新完成', 'success');
   };
 
-  const suggestions = getSuggestedDose(editingRecord, state.config);
+  const handleDeleteUser = async (phone: string) => {
+    if (!window.confirm('删除用户将连带删除其所有滴定历史，确定继续？')) return;
+    await dbOperation([STORES.USERS, STORES.HISTORY], 'readwrite', (tx) => {
+      tx.objectStore(STORES.USERS).delete(phone);
+      const hStore = tx.objectStore(STORES.HISTORY);
+      history.filter(h => h.userPhone === phone).forEach(h => hStore.delete(h.id));
+    });
+    setUsers(prev => prev.filter(u => u.phone !== phone));
+    setHistory(prev => prev.filter(h => h.userPhone !== phone));
+    if (activeUserPhone === phone) { setActiveUserPhone(null); setActiveTab('login'); }
+    showToast('档案及历史已清空', 'success');
+  };
 
-  const handleSaveRecord = () => {
-    if (!state.activeUserPhone) return alert('请先登录');
-    
-    const newRecord: DailyRecord = {
+  const handleSaveRecord = async () => {
+    if (!activeUserPhone) return;
+    const errs: Record<string, boolean> = {};
+    ['fbg', 'preLunchBG', 'preDinnerBG', 'bedtimeBG'].forEach(k => { if ((editingRecord as any)[k] === undefined) errs[k] = true; });
+    if (Object.keys(errs).length > 0) { setRecordErrors(errs); showToast('请补全血糖数据', 'error'); return; }
+
+    const date = editingRecord.date || new Date().toISOString().split('T')[0];
+    if (history.some(h => h.userPhone === activeUserPhone && h.date === date)) {
+      showToast(`该患者在 ${date} 已有保存记录，请先删除旧记录`, 'error');
+      return;
+    }
+
+    const rec: DailyRecord = {
       id: Date.now().toString(),
-      userPhone: state.activeUserPhone,
-      date: editingRecord.date || new Date().toISOString().split('T')[0],
-      fbg: editingRecord.fbg || 0,
-      preLunchBG: editingRecord.preLunchBG || 0,
-      preDinnerBG: editingRecord.preDinnerBG || 0,
-      bedtimeBG: editingRecord.bedtimeBG || 0,
-      curBasal: editingRecord.curBasal || 0,
-      curBreakfast: editingRecord.curBreakfast || 0,
-      curLunch: editingRecord.curLunch || 0,
-      curDinner: editingRecord.curDinner || 0,
-      sugBasal: suggestions.basal,
-      sugBreakfast: suggestions.breakfast,
-      sugLunch: suggestions.lunch,
-      sugDinner: suggestions.dinner,
+      userPhone: activeUserPhone,
+      date,
+      fbg: editingRecord.fbg!, preLunchBG: editingRecord.preLunchBG!, preDinnerBG: editingRecord.preDinnerBG!, bedtimeBG: editingRecord.bedtimeBG!,
+      curBasal: editingRecord.curBasal || 0, curBreakfast: editingRecord.curBreakfast || 0, curLunch: editingRecord.curLunch || 0, curDinner: editingRecord.curDinner || 0,
+      sugBasal: suggestions.basal, sugBreakfast: suggestions.breakfast, sugLunch: suggestions.lunch, sugDinner: suggestions.dinner
     };
 
-    setState(prev => ({
-      ...prev,
-      history: [newRecord, ...prev.history]
-    }));
-    alert('保存成功！记录已存入报表中心');
+    await dbOperation([STORES.HISTORY], 'readwrite', (tx) => tx.objectStore(STORES.HISTORY).add(rec));
+    setHistory(prev => [rec, ...prev]);
+    setEditingRecord(initialEditingRecord);
+    setActiveTab('history');
+    showToast('滴定方案已保存至报表', 'success');
   };
+
+  const handleDeleteRecord = async (id: string) => {
+    if (!window.confirm('确定删除此条滴定记录？')) return;
+    try {
+      await dbOperation([STORES.HISTORY], 'readwrite', (tx) => {
+        const store = tx.objectStore(STORES.HISTORY);
+        store.delete(id);
+      });
+      setHistory(prev => prev.filter(h => h.id !== id));
+      showToast('记录已移除', 'success');
+    } catch (e) {
+      showToast('删除失败', 'error');
+    }
+  };
+
+  const exportToExcel = (mode: 'current' | 'all') => {
+    const data = mode === 'current' ? filteredHistory : history;
+    if (data.length === 0) return showToast('无数据', 'info');
+    const sheetData = data.map(r => {
+      const u = users.find(user => user.phone === r.userPhone);
+      const total = r.sugBreakfast + r.sugLunch + r.sugDinner + r.sugBasal;
+      return {
+        '日期': r.date, 
+        '姓名': u?.name || '未知',
+        '手机号': r.userPhone,
+        '体重(kg)': u?.weight || '--',
+        '空腹血糖': r.fbg, 
+        '午餐前血糖': r.preLunchBG, 
+        '晚餐前血糖': r.preDinnerBG, 
+        '睡前血糖': r.bedtimeBG,
+        '建议早餐剂量': r.sugBreakfast,
+        '建议午餐剂量': r.sugLunch,
+        '建议晚餐剂量': r.sugDinner,
+        '建议基础剂量': r.sugBasal,
+        '全天总剂量': total
+      };
+    });
+    const ws = XLSX.utils.json_to_sheet(sheetData);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "滴定报表");
+    XLSX.writeFile(wb, `胰岛素滴定_${mode === 'current' ? '筛选' : '全量'}_${Date.now()}.xlsx`);
+  };
+
+  const filteredHistory = useMemo(() => history.filter(h => {
+    const u = users.find(user => user.phone === h.userPhone);
+    const phoneMatch = h.userPhone.includes(historyFilter.phone);
+    const nameMatch = !historyFilter.name || (u?.name && u.name.includes(historyFilter.name));
+    return phoneMatch && nameMatch;
+  }), [history, users, historyFilter]);
+
+  const displayedUsers = users.slice((userListPage - 1) * 10, userListPage * 10);
+  const displayedHistory = filteredHistory.slice((historyPage - 1) * 10, historyPage * 10);
+
+  if (!isDbReady) return <div className="flex items-center justify-center h-screen font-black text-slate-400">LOADING DATABASE...</div>;
 
   if (activeTab === 'login') {
     return (
       <Layout>
-        <div className="max-w-md mx-auto mt-10 space-y-8 animate-in fade-in duration-500">
+        {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+        <div className="max-w-md mx-auto mt-10 space-y-6">
           <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-2xl">
-            <h2 className="text-2xl font-black text-slate-800 mb-2">患者登录 / 注册</h2>
-            <p className="text-slate-400 text-sm mb-8">输入手机号即可快速开启滴定管理</p>
-            
+            <h2 className="text-2xl font-black text-slate-800 mb-6 italic">Clinic Portal 医生端</h2>
             <div className="space-y-4">
-              <input 
-                placeholder="手机号 (11位)" 
-                value={newUser.phone}
-                onChange={e => setNewUser({...newUser, phone: e.target.value})}
-                className="w-full p-4 bg-slate-50 border-none rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-bold text-lg"
-              />
+              <input placeholder="患者手机号" value={newUser.phone} onChange={e => setNewUser({...newUser, phone: e.target.value})} className={`w-full p-4 bg-slate-50 border-2 rounded-2xl font-bold outline-none ${loginErrors.phone ? 'border-red-500 bg-red-50' : 'border-transparent focus:ring-2 focus:ring-blue-500'}`} />
               <div className="grid grid-cols-2 gap-4">
-                <input 
-                  placeholder="姓名" 
-                  value={newUser.name}
-                  onChange={e => setNewUser({...newUser, name: e.target.value})}
-                  className="p-4 bg-slate-50 border-none rounded-2xl outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <input 
-                  placeholder="体重(kg)" 
-                  type="number"
-                  value={newUser.weight}
-                  onChange={e => setNewUser({...newUser, weight: e.target.value})}
-                  className="p-4 bg-slate-50 border-none rounded-2xl outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <input placeholder="姓名" value={newUser.name} onChange={e => setNewUser({...newUser, name: e.target.value})} className={`w-full p-4 bg-slate-50 border-2 rounded-2xl font-bold outline-none ${loginErrors.name ? 'border-red-500 bg-red-50' : 'border-transparent focus:ring-2 focus:ring-blue-500'}`} />
+                <input placeholder="体重(kg)" type="number" value={newUser.weight} onChange={e => setNewUser({...newUser, weight: e.target.value})} className={`w-full p-4 bg-slate-50 border-2 rounded-2xl font-bold outline-none ${loginErrors.weight ? 'border-red-500 bg-red-50' : 'border-transparent focus:ring-2 focus:ring-blue-500'}`} />
               </div>
-              <button 
-                onClick={() => handleLogin()}
-                className="w-full bg-blue-600 text-white py-4 rounded-2xl font-black shadow-lg shadow-blue-200 hover:bg-blue-700 transition-all active:scale-95"
-              >
-                进入系统
-              </button>
+              <button onClick={() => handleLogin()} className="w-full bg-blue-600 text-white py-4 rounded-2xl font-black hover:bg-blue-700 shadow-lg active:scale-95 transition-all">建立档案并进入</button>
             </div>
           </div>
-
-          <div className="bg-white/50 backdrop-blur p-6 rounded-3xl border border-white/40">
-            <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">最近患者 (最多显示5位)</h3>
-            <div className="space-y-2">
-              {state.users.slice(0, 5).map(u => (
-                <div 
-                  key={u.phone}
-                  onClick={() => handleLogin(u.phone)}
-                  className="flex items-center justify-between p-3 hover:bg-white rounded-xl cursor-pointer transition-all border border-transparent hover:border-slate-100 shadow-sm"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center font-bold text-xs">
-                      {u.name[0]}
-                    </div>
-                    <span className="font-bold text-slate-700">{u.name}</span>
+          {users.length > 0 && (
+            <div className="bg-white/50 backdrop-blur p-6 rounded-3xl border border-slate-200">
+              <h3 className="text-[10px] font-black text-slate-400 uppercase mb-3 tracking-widest">Quick Access 快捷入口</h3>
+              <div className="space-y-2">
+                {users.slice(0, 5).map(u => (
+                  <div key={u.phone} onClick={() => handleLogin(u.phone)} className="flex justify-between items-center p-3 bg-white hover:border-blue-300 border border-transparent rounded-xl cursor-pointer shadow-sm transition-all">
+                    <span className="font-bold text-slate-700">{u.name} <span className="text-[10px] opacity-40">{u.phone}</span></span>
+                    <span className="text-[10px] bg-blue-50 text-blue-600 px-2 py-1 rounded-lg font-black">{u.weight}kg</span>
                   </div>
-                  <span className="text-xs text-slate-400 font-mono">{u.phone}</span>
-                </div>
-              ))}
-              {state.users.length === 0 && <p className="text-center text-xs text-slate-300 py-4 italic">暂无患者记录</p>}
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </Layout>
     );
@@ -217,196 +272,104 @@ const App: React.FC = () => {
 
   return (
     <Layout>
-      <div className="no-print bg-slate-900 text-white p-4 mb-6 rounded-2xl flex justify-between items-center shadow-2xl">
-        <div className="flex items-center gap-6">
-          <div className="flex flex-col">
-            <span className="text-[10px] text-slate-400 font-bold uppercase">当前管理对象</span>
-            <span className="text-lg font-black">{currentUser?.name || '未选择'} <span className="text-xs font-normal opacity-50 ml-2">{currentUser?.phone}</span></span>
-          </div>
-          <div className="h-8 w-px bg-slate-800"></div>
-          <div className="flex flex-col">
-            <span className="text-[10px] text-slate-400 font-bold uppercase">注册时间</span>
-            <span className="text-sm font-medium">{currentUser?.createdAt || '--'}</span>
-          </div>
+      {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+      <div className="bg-slate-900 text-white p-6 mb-8 rounded-3xl flex justify-between items-center no-print shadow-xl">
+        <div className="flex gap-10">
+          <div><div className="text-[10px] opacity-40 uppercase font-black tracking-tighter">Current Patient</div><div className="text-xl font-black">{currentUser?.name}</div></div>
+          <div><div className="text-[10px] opacity-40 uppercase font-black tracking-tighter">Body Weight</div><div className="text-xl font-black">{currentUser?.weight}kg</div></div>
         </div>
-        <button onClick={() => setActiveTab('login')} className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded-xl text-xs font-bold transition-all">登出系统</button>
+        <button onClick={() => setActiveTab('login')} className="bg-white/10 hover:bg-white/20 px-6 py-2 rounded-2xl text-xs font-black transition-all">更换患者</button>
       </div>
 
-      <nav className="no-print flex gap-2 mb-8 bg-slate-100 p-1.5 rounded-2xl max-w-2xl mx-auto border border-slate-200">
-        {[
-          { id: 'main', label: '剂量滴定', icon: '💉' },
-          { id: 'userList', label: '患者档案', icon: '📋' },
-          { id: 'history', label: '报表中心', icon: '📊' },
-          { id: 'config', label: '全局规则', icon: '⚙️' }
-        ].map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => {
-              setActiveTab(tab.id as any);
-              if (tab.id === 'history' && currentUser) setHistoryFilter({ phone: currentUser.phone, name: currentUser.name });
-            }}
-            className={`flex-1 py-3 px-4 rounded-xl text-xs font-black flex items-center justify-center gap-2 transition-all ${
-              activeTab === tab.id ? 'bg-white text-blue-600 shadow-xl' : 'text-slate-500 hover:text-slate-800'
-            }`}
-          >
-            <span>{tab.icon}</span>
-            {tab.label}
-          </button>
+      <nav className="flex gap-2 mb-8 bg-slate-200 p-1.5 rounded-2xl max-w-xl mx-auto no-print">
+        {[{ id: 'main', l: '剂量滴定', i: '💉' }, { id: 'userList', l: '档案管理', i: '📋' }, { id: 'history', l: '报表中心', i: '📊' }, { id: 'config', l: '算法配置', i: '⚙️' }].map(t => (
+          <button key={t.id} onClick={() => setActiveTab(t.id as any)} className={`flex-1 py-3 rounded-xl text-xs font-black flex items-center justify-center gap-2 transition-all ${activeTab === t.id ? 'bg-white text-blue-600 shadow-md' : 'text-slate-500'}`}>{t.i}{t.l}</button>
         ))}
       </nav>
 
       {activeTab === 'main' && (
-        <div className="space-y-6 animate-in fade-in duration-500">
-          <div className="bg-white border border-slate-400 rounded-sm shadow-md overflow-hidden">
-            <table className="w-full text-sm border-collapse">
+        <div className="animate-in fade-in duration-500 space-y-6">
+          <div className="bg-white border-2 border-slate-200 rounded-3xl overflow-hidden shadow-2xl">
+            <table className="w-full text-center">
+              <thead className="bg-slate-50 border-b-2 border-slate-200 text-[10px] font-black uppercase text-slate-400">
+                <tr><td className="p-4 border-r-2">Date</td><td className="p-4 border-r-2">FBG 空腹</td><td className="p-4 border-r-2">午餐前</td><td className="p-4 border-r-2">晚餐前</td><td className="p-4">睡前</td></tr>
+              </thead>
               <tbody>
-                <tr className="bg-slate-50 border-b border-slate-400 font-bold text-center">
-                  <td className="p-3 border-r border-slate-400 w-40 text-left italic">DECISION MATRIX<br/><span className="text-[10px] text-slate-400">决策矩阵</span></td>
-                  <td className="p-3 border-r border-slate-400 w-40">ITEM<br/><span className="text-[10px] text-slate-400">监测项目</span></td>
-                  <td className="p-3 border-r border-slate-400 text-blue-700 uppercase">F.B.G<br/><span className="text-[10px] text-blue-500">空腹血糖</span></td>
-                  <td className="p-3 border-r border-slate-400 uppercase">Pre-Lunch<br/><span className="text-[10px] text-slate-400">午餐前血糖</span></td>
-                  <td className="p-3 border-r border-slate-400 uppercase">Pre-Dinner<br/><span className="text-[10px] text-slate-400">晚餐前血糖</span></td>
-                  <td className="p-3 uppercase">Bedtime<br/><span className="text-[10px] text-slate-400">睡前血糖</span></td>
-                </tr>
-                <tr className="border-b border-slate-400 h-28">
-                  <td rowSpan={2} className="p-4 border-r border-slate-400 bg-slate-50/20 text-center">
-                    <div className="text-[10px] font-bold text-slate-400 mb-1">DATE 日期</div>
-                    <input type="date" value={editingRecord.date} onChange={e => setEditingRecord({...editingRecord, date: e.target.value})} className="font-bold border rounded p-2 text-xs w-full text-center" />
-                  </td>
-                  <td className="p-3 border-r border-slate-400 bg-slate-50 text-center text-xs font-black leading-tight">
-                    BLOOD GLUCOSE<br/>
-                    <span className="text-blue-600 font-bold">血糖检测 (mmol/L)</span>
-                  </td>
-                  <td className="p-1 border-r border-slate-400 bg-blue-50/10">
-                    <input type="number" step="0.1" value={editingRecord.fbg || ''} onChange={e => setEditingRecord({...editingRecord, fbg: parseFloat(e.target.value) || 0})} className="w-full h-full p-4 text-center font-black text-4xl text-blue-600 outline-none" placeholder="0.0" />
-                  </td>
-                  <td className="p-1 border-r border-slate-400">
-                    <input type="number" step="0.1" value={editingRecord.preLunchBG || ''} onChange={e => setEditingRecord({...editingRecord, preLunchBG: parseFloat(e.target.value) || 0})} className="w-full h-full p-4 text-center font-black text-4xl text-slate-800 outline-none" placeholder="0.0" />
-                  </td>
-                  <td className="p-1 border-r border-slate-400">
-                    <input type="number" step="0.1" value={editingRecord.preDinnerBG || ''} onChange={e => setEditingRecord({...editingRecord, preDinnerBG: parseFloat(e.target.value) || 0})} className="w-full h-full p-4 text-center font-black text-4xl text-slate-800 outline-none" placeholder="0.0" />
-                  </td>
-                  <td className="p-1">
-                    <input type="number" step="0.1" value={editingRecord.bedtimeBG || ''} onChange={e => setEditingRecord({...editingRecord, bedtimeBG: parseFloat(e.target.value) || 0})} className="w-full h-full p-4 text-center font-black text-4xl text-slate-800 outline-none" placeholder="0.0" />
-                  </td>
-                </tr>
-                <tr className="border-b border-slate-400 bg-slate-50/50">
-                  <td className="p-3 border-r border-slate-400 text-center text-xs font-black leading-tight">
-                    CURRENT DOSE (U)<br/>
-                    <span className="text-slate-500 font-bold">目前用量 (单位)</span>
-                  </td>
-                  {[
-                    { key: 'curBreakfast', label: 'Morning (早前)' },
-                    { key: 'curLunch', label: 'Lunch (午前)' },
-                    { key: 'curDinner', label: 'Dinner (晚前)' },
-                    { key: 'curBasal', label: 'Basal/Night (基础)' }
-                  ].map((item, idx) => (
-                    <td key={item.key} className={`p-1 ${idx < 3 ? 'border-r border-slate-400' : ''}`}>
-                      <div className="text-[8px] text-center text-slate-400 font-bold uppercase mb-1">{item.label}</div>
-                      <input type="number" value={(editingRecord as any)[item.key] || ''} onChange={e => setEditingRecord({...editingRecord, [item.key]: parseInt(e.target.value) || 0})} className="w-full text-center font-bold text-xl outline-none bg-transparent" placeholder="--" />
+                <tr className="h-32">
+                  <td className="p-4 border-r-2 bg-slate-50"><input type="date" value={editingRecord.date} onChange={e => setEditingRecord({...editingRecord, date: e.target.value})} className="w-full bg-white border p-2 rounded-xl font-bold text-xs" /></td>
+                  {['fbg', 'preLunchBG', 'preDinnerBG', 'bedtimeBG'].map(k => (
+                    <td key={k} className={`p-1 border-r-2 last:border-0 transition-all ${recordErrors[k] ? 'bg-red-100' : ''}`}>
+                      <input type="number" step="0.1" value={(editingRecord as any)[k] ?? ''} onChange={e => setEditingRecord({...editingRecord, [k]: e.target.value === '' ? undefined : parseFloat(e.target.value)})} placeholder="--" className={`w-full h-full text-center font-black text-4xl outline-none bg-transparent ${recordErrors[k] ? 'text-red-700' : 'text-slate-800'}`} />
                     </td>
                   ))}
                 </tr>
-                <tr className="bg-blue-600 text-white font-bold h-36">
-                  <td colSpan={2} className="p-6 border-r border-blue-700 text-right leading-tight">
-                    <span className="text-lg uppercase">Suggested Plan</span><br/>
-                    <span className="text-base font-bold opacity-80">建议剂量调整方案</span>
-                  </td>
-                  {[suggestions.breakfast, suggestions.lunch, suggestions.dinner].map((val, i) => (
-                    <td key={i} className="p-4 border-r border-blue-700 text-center">
-                      <div className="text-[10px] opacity-60 mb-2 uppercase">Prandial 建议</div>
-                      <div className="text-5xl font-black">{val}<span className="text-xs opacity-40 ml-1">U</span></div>
+                <tr className="bg-slate-50 border-t-2 border-slate-200">
+                  <td className="p-4 border-r-2 font-black text-[10px] text-slate-400 uppercase tracking-widest">Current Dose (U)</td>
+                  {['curBreakfast', 'curLunch', 'curDinner', 'curBasal'].map(k => (
+                    <td key={k} className="p-4 border-r-2 last:border-0">
+                      <div className="text-[9px] opacity-40 font-black uppercase mb-1">{k.replace('cur','')}</div>
+                      <input type="number" value={(editingRecord as any)[k] ?? ''} onChange={e => setEditingRecord({...editingRecord, [k]: parseInt(e.target.value)||0})} className="w-full text-center font-black text-xl outline-none bg-transparent" />
                     </td>
                   ))}
-                  <td className="p-4 text-center bg-slate-900 border-l-4 border-slate-950">
-                    <div className="text-[10px] text-blue-400 mb-2 uppercase">Basal 基础建议</div>
-                    <div className="text-5xl font-black">{suggestions.basal}<span className="text-xs opacity-40 ml-1">U</span></div>
+                </tr>
+                <tr className="bg-blue-600 text-white h-36 font-black">
+                  <td className="p-4 border-r-2 border-blue-700 text-right"><div className="text-[10px] opacity-50 uppercase mb-1 tracking-widest">Clinic Suggestion</div>系统建议方案</td>
+                  {[suggestions.breakfast, suggestions.lunch, suggestions.dinner].map((s, i) => (
+                    <td key={i} className="p-4 border-r-2 border-blue-700">
+                      <div className="text-5xl tabular-nums">{s}<span className="text-xs opacity-40 ml-1">U</span></div>
+                      <div className="text-[10px] opacity-40 mt-1 uppercase">Prandial</div>
+                    </td>
+                  ))}
+                  <td className="p-4 bg-slate-900 border-l-4 border-slate-950">
+                    <div className="text-5xl text-blue-400 tabular-nums">{suggestions.basal}<span className="text-xs opacity-40 ml-1">U</span></div>
+                    <div className="text-[10px] opacity-40 mt-1 uppercase">Basal</div>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
-          <div className="flex justify-center">
-            <button onClick={() => { handleSaveRecord(); setEditingRecord({ ...editingRecord, fbg: 0, preLunchBG: 0, preDinnerBG: 0, bedtimeBG: 0 }); }} className="px-20 py-6 bg-blue-600 text-white font-black rounded-3xl shadow-2xl hover:bg-blue-700 active:scale-95 transition-all text-xl">确认并存入追踪库</button>
-          </div>
+          <div className="flex justify-center"><button onClick={handleSaveRecord} className="px-20 py-5 bg-blue-600 text-white font-black rounded-3xl shadow-2xl hover:bg-blue-700 hover:scale-105 transition-all text-xl active:scale-95">保存今日滴定决策</button></div>
         </div>
       )}
 
       {activeTab === 'userList' && (
-        <div className="space-y-6 animate-in slide-in-from-right duration-500">
-          <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
-            <div className="p-6 bg-slate-50 border-b flex justify-between items-center">
-              <h3 className="font-black text-slate-800">全量患者档案管理</h3>
-              <span className="text-xs text-slate-400">共 {state.users.length} 名患者</span>
-            </div>
-            <table className="w-full text-sm">
-              <thead className="bg-slate-50/50 text-slate-400 text-[10px] uppercase font-bold">
-                <tr>
-                  <th className="p-4 text-left">姓名</th>
-                  <th className="p-4 text-left">手机号</th>
-                  <th className="p-4 text-left">体重</th>
-                  <th className="p-4 text-left">注册时间</th>
-                  <th className="p-4 text-center">操作</th>
+        <div className="bg-white rounded-3xl border-2 border-slate-200 overflow-hidden shadow-sm animate-in slide-in-from-right duration-500">
+          <div className="p-6 bg-slate-50 border-b-2 flex justify-between items-center"><h3 className="font-black text-slate-800 text-lg uppercase italic">Archives</h3><span className="text-[10px] font-black bg-blue-100 text-blue-600 px-4 py-1.5 rounded-full uppercase">Count: {users.length}</span></div>
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-[10px] text-slate-400 font-black uppercase tracking-widest border-b">
+              <tr><th className="p-4 text-left">姓名</th><th className="p-4 text-left">手机号</th><th className="p-4 text-left">体重</th><th className="p-4 text-center">操作</th></tr>
+            </thead>
+            <tbody>
+              {displayedUsers.map(u => (
+                <tr key={u.phone} className="border-b last:border-0 hover:bg-slate-50 transition-all">
+                  <td className="p-4 font-bold">{u.name}</td><td className="p-4 font-mono text-slate-500">{u.phone}</td><td className="p-4 font-black text-blue-600">{u.weight}kg</td>
+                  <td className="p-4 text-center space-x-3">
+                    <button onClick={() => setEditingUser({...u})} className="text-[10px] font-black uppercase text-blue-600 hover:bg-blue-50 px-3 py-1.5 rounded-lg transition-all">修改</button>
+                    <button onClick={() => handleDeleteUser(u.phone)} className="text-[10px] font-black uppercase text-red-600 hover:bg-red-50 px-3 py-1.5 rounded-lg transition-all">删除</button>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {displayedUsers.map(u => (
-                  <tr key={u.phone} className="border-b border-slate-100 hover:bg-slate-50 transition-all">
-                    <td className="p-4 font-bold text-slate-700">{u.name}</td>
-                    <td className="p-4 text-slate-500 font-mono">{u.phone}</td>
-                    <td className="p-4 text-slate-500">{u.weight}kg</td>
-                    <td className="p-4 text-xs text-slate-400">{u.createdAt}</td>
-                    <td className="p-4 text-center flex items-center justify-center gap-2">
-                      <button 
-                        onClick={() => {
-                          setState(prev => ({ ...prev, activeUserPhone: u.phone }));
-                          setActiveTab('main');
-                        }}
-                        className="text-xs bg-slate-900 text-white px-3 py-2 rounded-xl font-bold hover:bg-black transition-all"
-                      >
-                        选择患者
-                      </button>
-                      <button 
-                        onClick={() => {
-                          setHistoryFilter({ phone: u.phone, name: u.name });
-                          setActiveTab('history');
-                        }}
-                        className="text-xs bg-blue-50 text-blue-600 px-3 py-2 rounded-xl font-bold hover:bg-blue-600 hover:text-white transition-all"
-                      >
-                        查看历史
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            
-            <div className="p-6 flex justify-between items-center bg-slate-50/30">
-              <button 
-                disabled={userListPage === 1}
-                onClick={() => setUserListPage(l => l - 1)}
-                className="p-2 disabled:opacity-30 text-xs font-bold"
-              >
-                上一页
-              </button>
-              <div className="flex gap-2">
-                {Array.from({ length: totalUserPages }).map((_, i) => (
-                  <button 
-                    key={i} 
-                    onClick={() => setUserListPage(i + 1)}
-                    className={`w-8 h-8 rounded-lg text-xs font-bold ${userListPage === i + 1 ? 'bg-blue-600 text-white' : 'bg-white'}`}
-                  >
-                    {i + 1}
-                  </button>
-                ))}
-              </div>
-              <button 
-                disabled={userListPage === totalUserPages}
-                onClick={() => setUserListPage(l => l + 1)}
-                className="p-2 disabled:opacity-30 text-xs font-bold"
-              >
-                下一页
-              </button>
+              ))}
+            </tbody>
+          </table>
+          <div className="p-4 flex justify-between items-center bg-slate-50/50">
+            <button disabled={userListPage === 1} onClick={() => setUserListPage(l => l - 1)} className="text-xs font-black uppercase disabled:opacity-20 hover:text-blue-600 transition-all">Prev</button>
+            <span className="text-[10px] font-black opacity-30 tracking-widest uppercase">Page {userListPage}</span>
+            <button disabled={userListPage >= Math.ceil(users.length/10)} onClick={() => setUserListPage(l => l + 1)} className="text-xs font-black uppercase disabled:opacity-20 hover:text-blue-600 transition-all">Next</button>
+          </div>
+        </div>
+      )}
+
+      {editingUser && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-md flex items-center justify-center z-[100] p-4 animate-in fade-in duration-300">
+          <div className="bg-white p-8 rounded-[40px] w-full max-w-sm shadow-2xl space-y-6">
+            <h3 className="text-xl font-black italic uppercase text-slate-800">Update Profile</h3>
+            <div className="space-y-4">
+              <div><label className="text-[10px] font-black opacity-40 uppercase ml-1 tracking-widest">Full Name</label><input value={editingUser.name} onChange={e => setEditingUser({...editingUser, name: e.target.value})} className="w-full p-4 bg-slate-50 border-none rounded-2xl font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all" /></div>
+              <div><label className="text-[10px] font-black opacity-40 uppercase ml-1 tracking-widest">Weight (kg)</label><input type="number" value={editingUser.weight} onChange={e => setEditingUser({...editingUser, weight: Number(e.target.value)})} className="w-full p-4 bg-slate-50 border-none rounded-2xl font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all" /></div>
+            </div>
+            <div className="flex gap-4">
+              <button onClick={handleUpdateUser} className="flex-1 py-4 bg-blue-600 text-white font-black rounded-2xl active:scale-95 transition-all">确认修改</button>
+              <button onClick={() => setEditingUser(null)} className="flex-1 py-4 bg-slate-100 text-slate-400 font-black rounded-2xl active:scale-95 transition-all">取消</button>
             </div>
           </div>
         </div>
@@ -416,115 +379,85 @@ const App: React.FC = () => {
         <div className="space-y-6 animate-in slide-in-from-bottom duration-500">
           <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm space-y-6">
             <div className="flex justify-between items-center">
-              <div>
-                <h3 className="text-xl font-black text-slate-800">滴定监测报表中心</h3>
-                <p className="text-xs text-slate-400">支持基于手机号/姓名的多维数据检索</p>
-              </div>
-              <div className="flex gap-3">
-                <button onClick={() => exportToExcel('current')} className="bg-blue-50 text-blue-600 px-6 py-3 rounded-2xl text-xs font-bold border border-blue-100 flex items-center gap-2">
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                  </svg>
-                  导出 Excel 筛选结果
-                </button>
-                <button onClick={() => exportToExcel('all')} className="bg-slate-900 text-white px-6 py-3 rounded-2xl text-xs font-bold shadow-lg shadow-slate-200">导出全量数据库</button>
+              <div><h3 className="text-xl font-black uppercase italic text-slate-800">History Records</h3><p className="text-xs text-slate-400 tracking-tight">物理物理删除与全量导出，支持分页查询</p></div>
+              <div className="flex gap-2">
+                <button onClick={() => exportToExcel('current')} className="bg-blue-50 text-blue-600 px-5 py-2.5 rounded-xl text-xs font-black hover:bg-blue-100 transition-all">导出当前</button>
+                <button onClick={() => exportToExcel('all')} className="bg-slate-900 text-white px-5 py-2.5 rounded-xl text-xs font-black hover:bg-black transition-all">全量备份</button>
               </div>
             </div>
-            
-            <div className="grid grid-cols-2 gap-6 bg-slate-50 p-6 rounded-2xl border border-slate-100">
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">筛选患者姓名</label>
-                <input 
-                  value={historyFilter.name}
-                  onChange={e => setHistoryFilter({...historyFilter, name: e.target.value})}
-                  placeholder="输入关键字..."
-                  className="w-full p-3 bg-white border-none rounded-xl outline-none focus:ring-2 focus:ring-blue-200"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">筛选手机号</label>
-                <input 
-                  value={historyFilter.phone}
-                  onChange={e => setHistoryFilter({...historyFilter, phone: e.target.value})}
-                  placeholder="输入号码..."
-                  className="w-full p-3 bg-white border-none rounded-xl outline-none focus:ring-2 focus:ring-blue-200 font-mono"
-                />
-              </div>
+            <div className="grid grid-cols-2 gap-4 bg-slate-50 p-4 rounded-2xl">
+              <input placeholder="患者姓名" value={historyFilter.name} onChange={e => setHistoryFilter({...historyFilter, name: e.target.value})} className="p-4 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-blue-500 transition-all" />
+              <input placeholder="手机号检索" value={historyFilter.phone} onChange={e => setHistoryFilter({...historyFilter, phone: e.target.value})} className="p-4 bg-white border border-slate-200 rounded-xl text-xs font-mono outline-none focus:ring-2 focus:ring-blue-500 transition-all" />
             </div>
-
-            <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-inner">
-              <table className="w-full text-xs">
-                <thead className="bg-slate-50 border-b">
-                  <tr className="font-bold text-slate-400 uppercase">
-                    <th className="p-4 text-left">Date 日期</th>
-                    <th className="p-4 text-left">Patient 患者</th>
-                    <th className="p-4 text-left">Glucose Trend 血糖趋势</th>
-                    <th className="p-4 text-right">Adjustment 建议剂量 (早/午/晚/基)</th>
+            <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-inner overflow-x-auto">
+              <table className="w-full text-[10px]">
+                <thead className="bg-slate-50 border-b text-slate-400 font-black uppercase tracking-widest">
+                  <tr>
+                    <th className="p-4 text-left whitespace-nowrap">Date</th>
+                    <th className="p-4 text-left whitespace-nowrap">Patient (Wt)</th>
+                    <th className="p-4 text-center whitespace-nowrap">BG Matrix</th>
+                    <th className="p-4 text-right whitespace-nowrap">Adjustment (U)</th>
+                    <th className="p-4 text-right whitespace-nowrap">Total (U)</th>
+                    <th className="p-4 text-center whitespace-nowrap">Action</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredHistory.slice(0, 100).map(r => {
-                    const user = state.users.find(u => u.phone === r.userPhone);
+                  {displayedHistory.map(r => {
+                    const u = users.find(user => user.phone === r.userPhone);
+                    const totalDose = r.sugBreakfast + r.sugLunch + r.sugDinner + r.sugBasal;
                     return (
-                      <tr key={r.id} className="border-b last:border-0 hover:bg-blue-50/30 transition-all">
-                        <td className="p-4 font-bold text-slate-600">{r.date}</td>
+                      <tr key={r.id} className="border-b last:border-0 hover:bg-blue-50/20 transition-all">
+                        <td className="p-4 font-bold text-slate-600 whitespace-nowrap">{r.date}</td>
                         <td className="p-4">
-                          <p className="font-bold text-slate-800">{user?.name || '未知'}</p>
-                          <p className="text-[10px] text-slate-400 font-mono">{r.userPhone}</p>
+                          <div className="font-black text-slate-800">{u?.name} ({u?.weight}kg)</div>
+                          <div className="text-[8px] opacity-40 font-mono tracking-tighter">{r.userPhone}</div>
                         </td>
-                        <td className="p-4 font-medium text-slate-500">
-                          <span className="text-blue-600">{r.fbg}</span> → {r.preLunchBG} → {r.preDinnerBG} → {r.bedtimeBG}
+                        <td className="p-4 text-center font-bold text-slate-400">
+                          <span className="text-blue-600">{r.fbg}</span> | {r.preLunchBG} | {r.preDinnerBG} | {r.bedtimeBG}
                         </td>
-                        <td className="p-4 text-right font-black text-blue-700 text-sm">
-                          {r.sugBreakfast} / {r.sugLunch} / {r.sugDinner} / <span className="text-slate-900">{r.sugBasal}u</span>
+                        <td className="p-4 text-right font-black text-blue-700 tabular-nums tracking-tighter whitespace-nowrap">
+                          {r.sugBreakfast}/{r.sugLunch}/{r.sugDinner}/<span className="text-slate-900 bg-slate-100 px-1 rounded">{r.sugBasal}u</span>
+                        </td>
+                        <td className="p-4 text-right">
+                          <span className="bg-blue-600 text-white px-2 py-0.5 rounded-full font-black tabular-nums">{totalDose}u</span>
+                        </td>
+                        <td className="p-4 text-center">
+                          <button onClick={() => handleDeleteRecord(r.id)} className="text-red-500 font-black uppercase text-[8px] bg-red-50 px-2 py-1 rounded-lg hover:bg-red-600 hover:text-white transition-all">Del</button>
                         </td>
                       </tr>
                     );
                   })}
-                  {filteredHistory.length === 0 && (
-                    <tr><td colSpan={4} className="p-20 text-center text-slate-300 italic">未查询到符合条件的滴定记录</td></tr>
-                  )}
+                  {displayedHistory.length === 0 && <tr><td colSpan={6} className="p-20 text-center text-slate-300 italic font-bold">No records found.</td></tr>}
                 </tbody>
               </table>
+            </div>
+            <div className="flex justify-between items-center px-2">
+              <button disabled={historyPage === 1} onClick={() => setHistoryPage(p => p - 1)} className="text-[10px] font-black uppercase opacity-40 hover:opacity-100 disabled:opacity-10 hover:text-blue-600 transition-all">Previous</button>
+              <div className="flex gap-2">
+                {Array.from({ length: Math.ceil(filteredHistory.length/10) }).map((_, i) => (
+                  <button key={i} onClick={() => setHistoryPage(i + 1)} className={`w-8 h-8 rounded-lg text-[10px] font-black transition-all ${historyPage === i + 1 ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}>{i+1}</button>
+                ))}
+              </div>
+              <button disabled={historyPage >= Math.ceil(filteredHistory.length/10) || historyPage === 0} onClick={() => setHistoryPage(p => p + 1)} className="text-[10px] font-black uppercase opacity-40 hover:opacity-100 disabled:opacity-10 hover:text-blue-600 transition-all">Next</button>
             </div>
           </div>
         </div>
       )}
 
       {activeTab === 'config' && (
-        <div className="max-w-4xl mx-auto space-y-8 animate-in zoom-in-95 duration-500 pb-20">
-          <div className="bg-white border border-slate-200 rounded-3xl overflow-hidden shadow-sm">
-            <div className="p-8 border-b flex justify-between items-center">
-              <div>
-                <h3 className="text-xl font-black text-slate-800">滴定决策引擎配置 (Algorithm Config)</h3>
-                <p className="text-sm text-slate-400">修改全局算法权重、初始剂量分配比及滴定梯度</p>
-              </div>
-              <button onClick={() => setState({...state, config: DEFAULT_CONFIG})} className="text-xs bg-red-50 text-red-500 px-6 py-3 rounded-2xl font-bold hover:bg-red-500 hover:text-white transition-all uppercase tracking-widest">Reset to Standard</button>
+        <div className="max-w-2xl mx-auto space-y-6 animate-in zoom-in-95 duration-500 pb-20">
+          <div className="bg-white border-2 border-slate-200 rounded-3xl p-8 shadow-sm">
+            <h3 className="text-xl font-black italic uppercase mb-8 border-b-2 border-slate-100 pb-4 text-slate-800">Algorithm Tuner</h3>
+            <div className="grid grid-cols-2 gap-10">
+              <div className="space-y-2"><label className="text-[10px] font-black opacity-40 uppercase tracking-widest ml-1">Initial Factor (U/kg)</label><input type="number" step="0.1" value={config.tddFactor} onChange={e => {const c={...config, tddFactor: Number(e.target.value)}; setConfig(c); dbOperation([STORES.CONFIG],'readwrite',tx=>tx.objectStore(STORES.CONFIG).put({id:'main_config',data:c}))}} className="w-full p-4 bg-slate-50 border-none rounded-2xl font-black text-3xl outline-none focus:ring-4 focus:ring-blue-100 transition-all" /></div>
+              <div className="space-y-2"><label className="text-[10px] font-black opacity-40 uppercase tracking-widest ml-1">Basal Ratio (%)</label><input type="number" step="0.05" value={config.basalRatio} onChange={e => {const c={...config, basalRatio: Number(e.target.value)}; setConfig(c); dbOperation([STORES.CONFIG],'readwrite',tx=>tx.objectStore(STORES.CONFIG).put({id:'main_config',data:c}))}} className="w-full p-4 bg-slate-50 border-none rounded-2xl font-black text-3xl outline-none focus:ring-4 focus:ring-blue-100 transition-all" /></div>
             </div>
-            <div className="p-8 grid grid-cols-2 gap-12">
-              <div className="space-y-3">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">初始剂量系数 (U / kg)</label>
-                <input type="number" step="0.1" value={state.config.tddFactor} onChange={e => setState({...state, config: {...state.config, tddFactor: Number(e.target.value)}})} className="w-full p-4 bg-slate-50 border-none rounded-2xl font-black text-3xl outline-none focus:ring-4 focus:ring-blue-100" />
-                <p className="text-[10px] text-slate-400 leading-relaxed italic">注: 初始每日总剂量 (TDD) 估算系数。根据患者体质量设定，通常以 0.5 U·kg-1 为估算基准。</p>
-              </div>
-              <div className="space-y-3">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">基础胰岛素分配占比</label>
-                <input type="number" step="0.05" value={state.config.basalRatio} onChange={e => setState({...state, config: {...state.config, basalRatio: Number(e.target.value)}})} className="w-full p-4 bg-slate-50 border-none rounded-2xl font-black text-3xl outline-none focus:ring-4 focus:ring-blue-100" />
-                <p className="text-[10px] text-slate-400 leading-relaxed italic">注: TDD 中分配给基础量 (Basal) 的比例。默认为 0.5 (即 50%)，剩余 50% 由三餐均分。</p>
-              </div>
+            <div className="mt-10 p-6 bg-slate-900 rounded-2xl text-white/70 text-[11px] leading-relaxed font-mono uppercase italic border-l-4 border-blue-600">
+              * Guideline Rules (v10.0-PRO): <br/>
+              * FBG: &gt;10(+6U), 8-10(+4U), 7-7.9(+2U), &lt;4.4(-2U). <br/>
+              * Prandial: Target 4.4-7.8 mmol/L. <br/>
+              * Shift: Post-meal BG titrates Pre-meal Dose.
             </div>
-          </div>
-          <div className="p-8 bg-blue-900 rounded-3xl text-white/80 text-sm leading-relaxed shadow-2xl relative overflow-hidden">
-             <div className="relative z-10">
-               <h4 className="font-black text-white mb-2 flex items-center gap-2 text-base">
-                 <span className="w-2 h-2 bg-blue-400 rounded-full animate-pulse"></span>
-                 System Core Engine Status
-               </h4>
-               <p className="opacity-70 text-xs">算法模式: 智能错位滴定 (FBG -> Basal, Post-Prandial Prediction -> Pre-Prandial adjustment)</p>
-               <p className="opacity-70 text-xs mt-1">数据架构: 浏览器本地持久化 + SheetJS Excel 交互模块</p>
-               <p className="opacity-70 text-xs mt-1">开发版本: v5.2 (桌面便携版兼容优化)</p>
-             </div>
-             <div className="absolute -right-10 -bottom-10 w-48 h-48 bg-white/5 rounded-full blur-3xl"></div>
           </div>
         </div>
       )}
