@@ -313,7 +313,7 @@ const App: React.FC = () => {
           <div className="bg-white border-2 border-slate-100 rounded-[40px] overflow-hidden shadow-2xl">
             <table className="w-full text-center">
               <thead className="bg-slate-50 border-b-2 border-slate-100 text-[10px] font-black uppercase text-slate-400 tracking-widest">
-                <tr><td className="p-5 border-r-2">Date</td><td className="p-5 border-r-2">FBG 空腹</td><td className="p-5 border-r-2">午餐前</td><td className="p-5 border-r-2">晚餐前</td><td className="p-5">睡前</td></tr>
+                <tr><td className="p-5 border-r-2">Date/日期</td><td className="p-5 border-r-2">FBG 空腹</td><td className="p-5 border-r-2">午餐前</td><td className="p-5 border-r-2">晚餐前</td><td className="p-5">睡前</td></tr>
               </thead>
               <tbody>
                 <tr className="h-32">
