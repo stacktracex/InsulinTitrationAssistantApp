@@ -1,0 +1,5 @@
+{
+  "name": "胰岛素智能助手 (桌面便携版)",
+  "description": "临床医生专用的专业胰岛素滴定支持工具，支持离线运行、单文件导出及 Windows/Mac 桌面化安装。",
+  "requestFramePermissions": []
+}

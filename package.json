@@ -1,0 +1,13 @@
+
+{
+  "name": "insulin-titration-helper",
+  "version": "1.0.0",
+  "main": "main.js",
+  "description": "胰岛素剂量计算与滴定助手桌面版",
+  "author": "Medical AI",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --windows",
+    "build:mac": "electron-builder --macos"
+  }
+}

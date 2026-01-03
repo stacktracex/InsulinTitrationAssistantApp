@@ -1,0 +1,17 @@
+
+{
+  "name": "胰岛素智能助手",
+  "short_name": "胰岛素助手",
+  "description": "专业胰岛素滴定决策支持工具",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/2864/2864448.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
