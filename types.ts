@@ -1,4 +1,11 @@
 
+export interface UserProfile {
+  name: string;
+  phone: string; // 唯一标识
+  weight: number;
+  createdAt: string;
+}
+
 export interface InitialDoseResult {
   weight: number;
   totalDose: number;
@@ -9,31 +16,28 @@ export interface InitialDoseResult {
 }
 
 export interface TitrationConfig {
-  tddFactor: number;        // 初始剂量系数 (U/kg)
-  basalRatio: number;      // 基础占比 (0.5 = 50%)
-  
-  // 基础胰岛素规则 (空腹)
+  tddFactor: number;
+  basalRatio: number;
   basalRules: {
-    fbgHighPlus6: number;   // > 10
-    fbgMedPlus4: number;    // 8-10
-    fbgLowPlus2: number;    // 7-7.9
-    fbgSafeMin: number;     // 4.4
-    fbgSafeMax: number;     // 6.9
-    basalDecr: number;      // -2u
+    fbgHighPlus6: number;
+    fbgMedPlus4: number;
+    fbgLowPlus2: number;
+    fbgSafeMin: number;
+    fbgSafeMax: number;
+    basalDecr: number;
   };
-  
-  // 餐时胰岛素规则 (下一餐前/睡前)
   prandialRules: {
-    bgHighPlus4: number;    // > 10
-    bgMedPlus2: number;     // 7.9-10
-    bgSafeMin: number;      // 4.4
-    bgSafeMax: number;      // 7.8
-    prandialDecr: number;   // -2u
+    bgHighPlus4: number;
+    bgMedPlus2: number;
+    bgSafeMin: number;
+    bgSafeMax: number;
+    prandialDecr: number;
   };
 }
 
 export interface DailyRecord {
   id: string;
+  userPhone: string; // 关联用户
   date: string;
   fbg: number;          
   preLunchBG: number;   
@@ -50,7 +54,8 @@ export interface DailyRecord {
 }
 
 export interface AppState {
-  profile: InitialDoseResult | null;
+  users: UserProfile[];
   history: DailyRecord[];
   config: TitrationConfig;
+  activeUserPhone: string | null;
 }
