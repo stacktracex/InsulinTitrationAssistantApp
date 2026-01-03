@@ -8,21 +8,19 @@
     <meta name="theme-color" content="#2563eb">
     <link rel="manifest" href="manifest.json">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             background-color: #f8fafc;
-            /* 优化 Windows 滚动条 */
             scrollbar-width: thin;
             scrollbar-color: #cbd5e1 #f8fafc;
         }
-        /* 针对桌面端的打印优化 */
         @media print {
             .no-print { display: none !important; }
             .print-only { display: block !important; }
             body { background: white; }
-            .bg-slate-900 { background: black !important; color: white !important; }
         }
     </style>
 <script type="importmap">
